@@ -27,6 +27,8 @@ ROOT_DIR = Path(__file__).absolute().parent
 # See references to GHIDRA_MODE to check what's missing
 GHIDRA_MODE = not(not os.getenv('GHIDRA'))
 
+# These types are polyfill for incomplete type in TIL,
+#  Only used when the corresponding types are not defined
 HELPER_TYPES = [
     'bool',
     '__u32', '__u16', '__u64', '__kernel_uid32_t', '__kernel_mqd_t', # gnulnx_arm(64)
@@ -49,26 +51,32 @@ def parseBlackList(envName, default):
             ret = default + ret
     return ret
 
-STRUCT_BLACKLIST = parseBlackList('STRUCT_BLACKLIST', [
-    '_SCHANNEL_CRED', '_Mbstatet'
-]) # _Mbstatet circular typedef
-TYPEDEF_BLACKLIST = parseBlackList('TYPEDEF_BLACKLIST', [
-    '_Mbstatet', 'va_list',
-])
+# Things that are builtin (so you can't do `typedef XXX wchar_t;`)
+#   We replace them to #define wchar_t XXXX
 TYPEDEF_BUILTIN = parseBlackList('TYPEDEF_BUILTIN', [
     'wchar_t', 'short', 'int', 'char',
     '_Bool', # Ghidra
 ])
+
+# Things that should NEVER outputted (can be used together with common.h)
+STRUCT_BLACKLIST = parseBlackList('STRUCT_BLACKLIST', [
+    '_SCHANNEL_CRED',
+    '_Mbstatet', # _Mbstatet circular typedef
+])
+TYPEDEF_BLACKLIST = parseBlackList('TYPEDEF_BLACKLIST', [
+    '_Mbstatet',
+    'va_list',
+])
 BLACKLIST_SYMS = parseBlackList('BLACKLIST_SYMS', [
-            'operator delete', 'operator delete[]', 'operator new', 'operator new[]', 'operator""s', 'operator&', 'operator+', 'operator-', 'operator<', 'operator^', 'operator|',
-            ' HUGE;'
+    'operator delete', 'operator delete[]', 'operator new', 'operator new[]', 'operator""s', 'operator&', 'operator+', 'operator-', 'operator<', 'operator^', 'operator|',
+    ' HUGE;'
 ])
 
 IDENTIFIER = r'\w\d_'
 IDENTIFIER_PAT = '[%s]+' % IDENTIFIER
-TYPE_MODIFIERS = ['const','unsigned']
 # Matches like: `unsigned XXX` `XXX`, non-capturing
 # match logic: find TYPE_MODIFIERS, and use lookahead to ensure no more TYPE_MODIFIERS left
+TYPE_MODIFIERS = ['const','unsigned']
 TYPEREF_PAT = r'(?:(?:%s) )*(?!%s)%s' % ('|'.join(TYPE_MODIFIERS), '|'.join(TYPE_MODIFIERS), IDENTIFIER_PAT) #
 
 ####################################################################################
@@ -118,14 +126,13 @@ def replaceTemplateArgs(content):
     genTemplatePat(9)
 
     def findPatInLine(pat):
-        if False:
-            for l in content.splitlines():
-                print(l)
-                for match in re.finditer(pat, l):
-                    yield match
-        else:
-            for match in re.finditer(pat, content):
-                yield match
+        # for debugging regex matching:
+        # for l in content.splitlines():
+        #     print(l)
+        #     for match in re.finditer(pat, l):
+        #         yield match
+        for match in re.finditer(pat, content):
+            yield match
     
     round = 0
     while True:
@@ -168,9 +175,6 @@ def sanitizeHdr(hdrContent):
     symbols = '\n'.join([c for c in symbols.splitlines() if '?' not in c])
     content = types + '\n\n' + symbols
 
-    #for typeName in TYPEDEF_BLACKLIST:
-    #    content = re.sub(r'\n(typedef .*? [*]*?' + typeName + ';)\n', '\n/*\\1*/\n', content)
-
     # remove vft & vtbl_layout
     content = re.sub(r'^struct /\*VFT\*/ ((.*?_vtbl) {.*?};)$', r'struct \2; /* \1*/', content, flags=re.MULTILINE)
     content = re.sub(r'^struct ((.*?_vtbl_layout) {.*?};)$', r'struct \2; /* \1*/', content, flags=re.MULTILINE)
@@ -178,9 +182,6 @@ def sanitizeHdr(hdrContent):
     # remove IDA missing oridinal type (like `#12 *field1;`)
     content = re.sub(r'#\d+ ', 'void ', content)
 
-    # remove coments
-    #content = remove_comments(content)
-    
     # Remove things that must be invalid
     content = content.replace('::', '__')
     content = content.replace('$', '_')
@@ -237,6 +238,7 @@ def parseDecls(types):
         #print("Processing Line: %s" % line[:80])
         try:
             oriLine = line
+            # TODO: why __attribute__ are now replaced here?
             for word in (
                     '__cdecl', '__cppobj', '__unaligned', 'volatile', 
                     '__declspec\([^()]+\)', '__declspec\([^()]+\([^()]+\)\)', # mssdk
@@ -430,7 +432,7 @@ def outputCtypesLibCpp(type_defs, symbols):
     # calculate dependencies between types
     typeDefDeps = {}
     print("Compiling all type regex...")
-    if True:
+    if True: # JS's RegExp is 10x faster than PyPy, 50x faster than CPython...
         with TemporaryDirectory() as tmpdir:
             typDefJson = tmpdir + '/' + 'typDef.json'
             regexRetJson = tmpdir + '/' + 'regexRet.json'
@@ -449,29 +451,6 @@ def outputCtypesLibCpp(type_defs, symbols):
         allTypeRegex = re.compile(r'(?<=[ ;*(){},\[])(%s)([ ;*(){},\[]+)' % ('|'.join(c for c in type_defs_sorted)))
         def parseTypDef(typName, typDef):
             return allTypeRegex.findall(typDef)
-    elif False:
-        allTypeRegex = re.compile('[ ;*(){},](%s)([ ;*(){},]+)(?=[ ;*(){},])' % ('|'.join(c for c in type_defs_sorted)))
-        def parseTypDef(typName, typDef):
-            #_typDef = re.sub(r'([ ;*(){},])', r' \1 ', typDef)
-            _typDef = typDef.replace(' ', '  ').replace(';', '; ').replace('*', ' *')
-            return allTypeRegex.findall(_typDef)
-    else:
-        # match only one char behind & ahead, manually test the span later
-        # we gamble that there won't be two types comes in 'AAA;BBB' or 'AAA BBB'
-        #   Case1: typedef AAA BBB; Case2: struct AAA : BBB,CCC {
-        #   but for safety, we replace ' ' into '  ', ',' into ' , '
-        allTypeRegex = re.compile('[ ;*(){},](%s)[ ;*(){},]' % ('|'.join(c for c in type_defs_sorted)))
-        def parseTypDef(typName, typDef):
-            s = []
-            _typDef = re.sub(r'([ ;({,])', r' \1 ', typDef)
-            for m in allTypeRegex.finditer(_typDef):
-                otherTyp = m.group(1)
-                if otherTyp == typName:
-                    continue
-                _, nameSpanE = m.span(1)
-                typNameEnd = _typDef[min(len(_typDef) - 1, nameSpanE):min(len(_typDef) - 1, nameSpanE + 4)].strip()
-                s.append((otherTyp, typNameEnd))
-            return s
 
     for typName, typInfo in type_defs_sorted.items():
         typeDefDeps[typName] = []
@@ -495,21 +474,16 @@ def outputCtypesLibCpp(type_defs, symbols):
             #if not otherTyp in typDef:
             #    continue
             if typInfo.typClass in FORWARD_DECL_TYPES:
+                # in struct we don't want field name to be checked
+                # example: struct _reent; struct _reent_XXXX { YYYY *_reent; }
+                # so removing pure forward decl
                 if all(typNameEnd[:1] == ';' for typNameEnd in typNameEndList):
                     continue
-            #checkPat = r'[ ;*(){},]%s[ ;*(){},]' % (otherTyp)
-            #if typInfo.typClass in FORWARD_DECL_TYPES:
-            #    # in struct we don't want field name to be checked
-            #    # example: struct _reent; struct _reent_XXXX { YYYY *_reent; }
-            #    checkPat = r'[ ;*(){},]%s[ *(){},]' % (otherTyp)
-            #if re.search(checkPat, typDef): # quick check
 
             if True:
                 # Check (XXX *A;)
-                #hasPointerRef = re.search(r'[ ;*(){},]%s *\*' % (otherTyp), typDef)
-                # Check (XXX A;)
-                #hasDirectRef = re.search(r'[ ;*(){},]%s +[^* ]' % (otherTyp), typDef)
                 hasPointerRef = any(typNameEnd.strip()[:1] == '*' for typNameEnd in typNameEndList)
+                # Check (XXX A;)
                 hasDirectRef = any(typNameEnd.strip()[:1] != '*' for typNameEnd in typNameEndList)
                 assert hasDirectRef or hasPointerRef
 
@@ -533,6 +507,7 @@ def outputCtypesLibCpp(type_defs, symbols):
                 if isDepend:
                     typeDefDeps[typName].append(otherTyp)
                 # HACK: masking cur type, but if other type share same name parts (like AAA and AAABB), this will interfere
+                # Actually useless now
                 typDef = typDef.replace(otherTyp, '$$$$')
                 
         #print("%s -> %s" % (typName, typeDefDeps[typName]))
