@@ -1,12 +1,17 @@
 # Generate inter-op wrappers of ctypes structs we used
+import json
 import os
 import re
 import subprocess
 from collections import OrderedDict
 
 import io
+from json import JSONEncoder
 
 from pathlib import Path
+
+from tempfile import TemporaryDirectory
+
 ROOT_DIR = Path(__file__).absolute().parent
 
 ####################################################################################
@@ -22,6 +27,14 @@ ROOT_DIR = Path(__file__).absolute().parent
 # See references to GHIDRA_MODE to check what's missing
 GHIDRA_MODE = not(not os.getenv('GHIDRA'))
 
+HELPER_TYPES = [
+    'bool',
+    '__u32', '__u16', '__u64', '__kernel_uid32_t', '__kernel_mqd_t', # gnulnx_arm(64)
+    'DOT11_DIRECTION', # mssdk
+    '_DEVICE_RELATION_TYPE', # mssdk64_win10
+    # 'DWORD', 'ULONG', # mscor
+]
+
 # these blacklist are names after cleanup, without ::/?/$/etc.
 def parseBlackList(envName, default):
     ret = default
@@ -36,8 +49,16 @@ def parseBlackList(envName, default):
             ret = default + ret
     return ret
 
-STRUCT_BLACKLIST = parseBlackList('STRUCT_BLACKLIST', ['_SCHANNEL_CRED', '_Mbstatet']) # _Mbstatet circular typedef
-TYPEDEF_BLACKLIST = parseBlackList('TYPEDEF_BLACKLIST', ['_Mbstatet', 'va_list'])
+STRUCT_BLACKLIST = parseBlackList('STRUCT_BLACKLIST', [
+    '_SCHANNEL_CRED', '_Mbstatet'
+]) # _Mbstatet circular typedef
+TYPEDEF_BLACKLIST = parseBlackList('TYPEDEF_BLACKLIST', [
+    '_Mbstatet', 'va_list',
+])
+TYPEDEF_BUILTIN = parseBlackList('TYPEDEF_BUILTIN', [
+    'wchar_t', 'short', 'int', 'char',
+    '_Bool', # Ghidra
+])
 BLACKLIST_SYMS = parseBlackList('BLACKLIST_SYMS', [
             'operator delete', 'operator delete[]', 'operator new', 'operator new[]', 'operator""s', 'operator&', 'operator+', 'operator-', 'operator<', 'operator^', 'operator|',
             ' HUGE;'
@@ -45,7 +66,10 @@ BLACKLIST_SYMS = parseBlackList('BLACKLIST_SYMS', [
 
 IDENTIFIER = r'\w\d_'
 IDENTIFIER_PAT = '[%s]+' % IDENTIFIER
-
+TYPE_MODIFIERS = ['const','unsigned']
+# Matches like: `unsigned XXX` `XXX`, non-capturing
+# match logic: find TYPE_MODIFIERS, and use lookahead to ensure no more TYPE_MODIFIERS left
+TYPEREF_PAT = r'(?:(?:%s) )*(?!%s)%s' % ('|'.join(TYPE_MODIFIERS), '|'.join(TYPE_MODIFIERS), IDENTIFIER_PAT) #
 
 ####################################################################################
 ####################################################################################
@@ -54,6 +78,10 @@ IDENTIFIER_PAT = '[%s]+' % IDENTIFIER
 ###
 ####################################################################################
 ####################################################################################
+
+class MyEncoder(JSONEncoder):
+    def default(self, o):
+        return o.__dict__
 
 # This function clears <XXX> template arg
 def replaceTemplateArgs(content):
@@ -132,6 +160,7 @@ def replaceTemplateArgs(content):
 # Convert IDA Cpp header into C header
 def sanitizeHdr(hdrContent):
     content = hdrContent
+    content = ''.join(c if ord(c) < 0x80 else '_u%04X' % (ord(c)) for c in content)
     
     # Note: We do blacklist later in filterDecls to achieve more precision
     
@@ -158,6 +187,8 @@ def sanitizeHdr(hdrContent):
     content = content.replace('?', '_')
     content = content.replace('~', '_del_')
     content = content.replace('\nconst struct', '\nstruct')
+    content = content.replace(' far *', ' *') # bc5w16: IOleInPlaceActiveObject far *This
+                                                # TODO: what about `near` in common.h? Maybe unify them
 
     content = replaceTemplateArgs(content)
 
@@ -198,70 +229,81 @@ def parseDecls(types):
     def add_type(cls, t, line):
         if t in type_defs:
             print("Offending decl: %s" % type_defs[t])
+        print("Got Type Def: %s" % t)
         assert not t in type_defs
         type_defs[t] = TypeDecl(cls, t, line)
 
     for line in types.splitlines():
-        print("Processing Line: %s" % line[:80])
-
-        oriLine = line
-        line = line.replace('__cdecl ', '').replace('__cppobj ', '')
-        
-        # Preprocess line for easier regex, but we still uses original line when add_type
-        _line = re.sub(r'__attribute__\(.*?\) ', '', line)
-        
-        # ignore comment line
-        if line.startswith('/*') or line.startswith('//'):
-            ignoredLines += 1
-            continue
-        
-        oriTypeLen = len(type_defs)
-        # handle enum
-        if _line.startswith('enum '):
-            matches = re.findall(r'enum (%s) (:|{)' % IDENTIFIER_PAT, _line)
-            if not matches: # for debug
+        #print("Processing Line: %s" % line[:80])
+        try:
+            oriLine = line
+            for word in (
+                    '__cdecl', '__cppobj', '__unaligned', 'volatile', 
+                    '__declspec\([^()]+\)', '__declspec\([^()]+\([^()]+\)\)', # mssdk
+                    '__far', # bc5w16: IOleInPlaceActiveObject far *This
+                    ):
+                line = re.sub(r'(^|(?<=[^%s]))%s ' % (IDENTIFIER, word), '', line)
+            
+            # Preprocess line for easier regex, but we still uses original line when add_type
+            _line = re.sub(r'__attribute__\(.*?\) ', '', line)
+            
+            # ignore comment line
+            if line.startswith('/*') or line.startswith('//'):
+                ignoredLines += 1
+                continue
+            
+            oriTypeLen = len(type_defs)
+            # handle enum
+            if _line.startswith('enum '):
+                matches = re.findall(r'^enum (%s)(;| :| {)' % IDENTIFIER_PAT, _line) # `enum XXX;` appears a lot in mssdk
+                if not matches: # for debug
+                    print(line)
+                match = matches[0][0]
+                add_type('enum', match, line)
+            # handle union
+            elif _line.startswith('union '):
+                match = re.findall(r'^union (%s)(;| {)' % IDENTIFIER_PAT, _line)[0][0]
+                add_type('union', match, line)
+            # handle struct
+            elif _line.startswith('struct '):
+                matches = []
+                # Struct with inherits
+                matches += re.findall(r'^struct (%s) : (%s|, )+? {' % (IDENTIFIER_PAT, IDENTIFIER_PAT), _line)
+                # Simple Struct
+                matches += re.findall(r'^struct (%s) {' % IDENTIFIER_PAT, _line)
+                # Forward Declaration Struct
+                matches += re.findall(r'^struct (%s);' % IDENTIFIER_PAT, _line)
+                for m in matches:
+                    if not isinstance(m, tuple):
+                        m = [m]
+    
+                    curdef = line
+                    add_type('struct', m[0], curdef)
+                    
+            elif _line.startswith('typedef '):
+                matches = []
+                # simple typedef: typedef XXX A;
+                matches += re.findall(r'^typedef .*?(%s);' % IDENTIFIER_PAT, _line)
+                # function call typedef: typedef A(XXX);
+                matches += re.findall(r'^typedef .*?(%s)\(.*?\);' % IDENTIFIER_PAT, _line)
+                # function pointer typedef: typedef (*A)(XXX);
+                matches += re.findall(r'^typedef .*?(%s)\)\(.*?\);' % IDENTIFIER_PAT, _line)
+                # array typedef1: typedef char A[XXX];
+                matches += re.findall(r'^typedef .*?(%s)\[.*?\];' % IDENTIFIER_PAT, _line)
+                # array typedef2: typedef char (*A)[XXX];
+                matches += re.findall(r'^typedef .*?(%s)\)\[.*?\];' % IDENTIFIER_PAT, _line)
+                if not matches:
+                    print(line)
+                add_type('typedef', matches[0], line)
+            else:
                 print(line)
-            match = matches[0][0]
-            add_type('enum', match, line)
-        # handle union
-        elif _line.startswith('union '):
-            match = re.findall(r'union (%s)(;| {)' % IDENTIFIER_PAT, _line)[0][0]
-            add_type('union', match, line)
-        # handle struct
-        elif _line.startswith('struct '):
-            matches = []
-            # Struct with inherits
-            matches += re.findall(r'struct (%s) : (%s|, )+? {' % (IDENTIFIER_PAT, IDENTIFIER_PAT), _line)
-            # Simple Struct
-            matches += re.findall(r'struct (%s) {' % IDENTIFIER_PAT, _line)
-            # Forward Declaration Struct
-            matches += re.findall(r'struct (%s);' % IDENTIFIER_PAT, _line)
-            for m in matches:
-                if not isinstance(m, tuple):
-                    m = [m]
-
-                curdef = line
-                add_type('struct', m[0], curdef)
-                
-        elif _line.startswith('typedef '):
-            matches = []
-            # simple typedef: typedef XXX A;
-            matches += re.findall(r'typedef .*?(%s);' % IDENTIFIER_PAT, _line)
-            # function call typedef: typedef A(XXX);
-            matches += re.findall(r'typedef .*?(%s)\(.*?\);' % IDENTIFIER_PAT, _line)
-            # function pointer typedef: typedef (*A)(XXX);
-            matches += re.findall(r'typedef .*?(%s)\)\(.*?\);' % IDENTIFIER_PAT, _line)
-            # array typedef: typedef A[XXX];
-            matches += re.findall(r'typedef .*?(%s)\[.*?\];' % IDENTIFIER_PAT, _line)
-            if not matches:
+                assert False, "Cannot parse line: %s" % line
+            if len(type_defs) - oriTypeLen != 1:
                 print(line)
-            add_type('typedef', matches[0], line)
-        else:
-            print(line)
-            assert False, "Cannot parse line: %s" % line
-        if len(type_defs) - oriTypeLen != 1:
-            print(line)
-            assert False, "One line should only have one type, but we defined %d types" % (len(type_defs) - oriTypeLen)
+                assert False, "One line should only have one type, but we defined %d types" % (len(type_defs) - oriTypeLen)
+        except Exception:
+            print("ErrorLine: %s" % line)
+            raise
     return type_defs, ignoredLines
 
 
@@ -287,10 +329,10 @@ def filterDecls(type_defs, depends):
                 type_defs.pop(t)
                 continue
 
-    deps = '\n'.join([open(Path(c).with_suffix('.cpp')).read() for c in depends])
+    deps = '\n'.join([open(Path(c)).read() for c in depends])
     for t in list(type_defs.keys()):
         # HACK: simple regex to check if a struct defined in dependencies
-        if re.search(r' %s [{:]' % t, deps):
+        if re.search(r'^(struct|union|enum)( [\w\d_]+)*%s [{:]' % t, deps):
             type_defs.pop(t)
 
     return type_defs
@@ -361,6 +403,7 @@ def processDecls(type_defs):
                 # Ghidra does not support enumclass
                 _line = re.sub(r'enum class ([A-z0-9_]+?) : ([a-z0-9_ ]+?) {', r'enum \1 {', _line)
                 _line = re.sub(r'enum class ([A-z0-9_]+?) {', r'enum \1 {', _line)
+                _line = re.sub(r'^enum class ', r'enum ', _line)
 
         typInfo.typDef = _line
 
@@ -386,17 +429,90 @@ def outputCtypesLibCpp(type_defs, symbols):
 
     # calculate dependencies between types
     typeDefDeps = {}
+    print("Compiling all type regex...")
+    if True:
+        with TemporaryDirectory() as tmpdir:
+            typDefJson = tmpdir + '/' + 'typDef.json'
+            regexRetJson = tmpdir + '/' + 'regexRet.json'
+            with open(typDefJson, 'w') as f:
+                json.dump(type_defs, f, cls=MyEncoder)
+            subprocess.check_call(['node', str(ROOT_DIR / 'regexHelper.js'), typDefJson, regexRetJson])
+            with open(regexRetJson) as f:
+                regexRet = json.load(f)
+        def parseTypDef(typName, typDef):
+            return (tuple(c) for c in regexRet[typName])
+
+    elif False: # 2x+ Faster in both PyPy and CPython
+        # Must uses look ahead here
+        # Example: struct AAA {BBB field;} would only got AAA
+        #      because AAA match occupys ' {', while BBB match needs the '{' in front it
+        allTypeRegex = re.compile(r'(?<=[ ;*(){},\[])(%s)([ ;*(){},\[]+)' % ('|'.join(c for c in type_defs_sorted)))
+        def parseTypDef(typName, typDef):
+            return allTypeRegex.findall(typDef)
+    elif False:
+        allTypeRegex = re.compile('[ ;*(){},](%s)([ ;*(){},]+)(?=[ ;*(){},])' % ('|'.join(c for c in type_defs_sorted)))
+        def parseTypDef(typName, typDef):
+            #_typDef = re.sub(r'([ ;*(){},])', r' \1 ', typDef)
+            _typDef = typDef.replace(' ', '  ').replace(';', '; ').replace('*', ' *')
+            return allTypeRegex.findall(_typDef)
+    else:
+        # match only one char behind & ahead, manually test the span later
+        # we gamble that there won't be two types comes in 'AAA;BBB' or 'AAA BBB'
+        #   Case1: typedef AAA BBB; Case2: struct AAA : BBB,CCC {
+        #   but for safety, we replace ' ' into '  ', ',' into ' , '
+        allTypeRegex = re.compile('[ ;*(){},](%s)[ ;*(){},]' % ('|'.join(c for c in type_defs_sorted)))
+        def parseTypDef(typName, typDef):
+            s = []
+            _typDef = re.sub(r'([ ;({,])', r' \1 ', typDef)
+            for m in allTypeRegex.finditer(_typDef):
+                otherTyp = m.group(1)
+                if otherTyp == typName:
+                    continue
+                _, nameSpanE = m.span(1)
+                typNameEnd = _typDef[min(len(_typDef) - 1, nameSpanE):min(len(_typDef) - 1, nameSpanE + 4)].strip()
+                s.append((otherTyp, typNameEnd))
+            return s
+
     for typName, typInfo in type_defs_sorted.items():
         typeDefDeps[typName] = []
         typDef = typInfo.typDef
-        for otherTyp in type_defs_sorted:
+        print("Calculating dependency for: %s" % typName)
+        if typInfo.typClass == 'enum': # enum will never have dependencies
+            continue
+
+        otherTypMap = {}
+        for otherTyp, typNameEnd in set(parseTypDef(typName, typDef)):
+            if not otherTyp in otherTypMap:
+                otherTypMap[otherTyp] = set()
+            otherTypMap[otherTyp].add(typNameEnd.strip()) # strips here
+
+        if 'JSStaticFunction' == typName:
+            print(otherTypMap)
+        for otherTyp in otherTypMap:
+            typNameEndList = otherTypMap[otherTyp]
             if otherTyp == typName:
                 continue
-            if otherTyp in typDef and re.search(r'[ ;*(){},]%s[ ;*(){},]' % (otherTyp), typDef):
+            #if not otherTyp in typDef:
+            #    continue
+            if typInfo.typClass in FORWARD_DECL_TYPES:
+                if all(typNameEnd[:1] == ';' for typNameEnd in typNameEndList):
+                    continue
+            #checkPat = r'[ ;*(){},]%s[ ;*(){},]' % (otherTyp)
+            #if typInfo.typClass in FORWARD_DECL_TYPES:
+            #    # in struct we don't want field name to be checked
+            #    # example: struct _reent; struct _reent_XXXX { YYYY *_reent; }
+            #    checkPat = r'[ ;*(){},]%s[ *(){},]' % (otherTyp)
+            #if re.search(checkPat, typDef): # quick check
+
+            if True:
                 # Check (XXX *A;)
-                hasPointerRef = re.search(r'[ ;*(){},]%s *\*' % (otherTyp), typDef)
+                #hasPointerRef = re.search(r'[ ;*(){},]%s *\*' % (otherTyp), typDef)
                 # Check (XXX A;)
-                hasDirectRef = re.search(r'[ ;*(){},]%s +[^* ]' % (otherTyp), typDef)
+                #hasDirectRef = re.search(r'[ ;*(){},]%s +[^* ]' % (otherTyp), typDef)
+                hasPointerRef = any(typNameEnd.strip()[:1] == '*' for typNameEnd in typNameEndList)
+                hasDirectRef = any(typNameEnd.strip()[:1] != '*' for typNameEnd in typNameEndList)
+                assert hasDirectRef or hasPointerRef
+
                 otherTypInfo = type_defs_sorted[otherTyp]
                 isDepend = True
 
@@ -428,6 +544,17 @@ def outputCtypesLibCpp(type_defs, symbols):
     for t in typeDefDeps_sorted:
         print("%s -> %s" % (t, typeDefDeps_sorted[t]))
 
+    # Perform builtin type rewrite AFTER depencendy, then replace them into macro
+    builtinDefs = {}
+    for n, t in type_defs.items():
+        if n in TYPEDEF_BUILTIN:
+            builtinDefs[n] = t
+            _m = re.findall('^typedef ([\d\w ]+) (%s)' % (n), t.typDef)
+            if not _m:
+                continue
+            m = _m[0]
+            t.typDef = '#define %s %s' % (n, m[0])  # group1
+
     # BFS the dependency tree, pops the known class each round
     typeLines = []
     typKnown = []
@@ -450,7 +577,7 @@ def outputCtypesLibCpp(type_defs, symbols):
                 raise Exception(errmsg)
 
 
-    # Process symbols now
+    # (IDA Only) Process symbols now
     symbolLines = []
     for symLine in symbols.splitlines():
         if symLine.startswith('#error '):
@@ -458,7 +585,8 @@ def outputCtypesLibCpp(type_defs, symbols):
 
         if any(c in symLine for c in BLACKLIST_SYMS):
             continue
-        
+
+        ## TODO: Make this configurable
         # for: int __cdecl _stat32(const char *_FileName, _stat32 *_Stat);
         symLine = symLine.replace('_stat32 *', 'struct _stat32 *').replace('_stat32i64 *', 'struct _stat32i64 *').replace('_stat64 *', 'struct _stat64 *').replace('_stat64i32 *', 'struct _stat64i32 *')
 
@@ -472,6 +600,8 @@ def outputCtypesLibCpp(type_defs, symbols):
         symbolLines.append(symLine)
 
     f = io.StringIO()
+    #f.write('\n'.join( c.typDef for c in builtinDefs.values()))
+    f.write('\n\n')
     # Forward declaration first (struct XXX;)
     f.write('\n'.join('%s %s;' % (t.typClass, n) for n,t in type_defs_sorted.items() if t.typClass in FORWARD_DECL_TYPES))
     f.write('\n\n')
@@ -503,13 +633,40 @@ def sanitizeOutput(outCppContent):
         outCppContent = re.sub(r'(?<=[ *])%s(?=[;[])' % token, r'%s' % replaceToken, outCppContent)
     outCppContent = outCppContent.replace(r'(...)', r'(int, ...)')
 
+    # replace invalid uses of bool in arm/wince.h like parameter: (XXXX bool,)
+    outCppContent = re.sub(r'(%s[ *]+)bool(?=[,)])' % TYPEREF_PAT, r'\1_bool', outCppContent)
+
     if GHIDRA_MODE:
         # Ghidra does not support __int128
         outCppContent = outCppContent.replace(r'unsigned __int128', r'__uint128')
         # Ghidra does not support array definition in parameter
-        outCppContent = outCppContent.replace(r'[],', r'*,').replace(r'[])', r'*)')
-
-        outCppContent = ''.join(c if ord(c) < 0x80 else '_u%04X' % (ord(c)) for c in outCppContent)
+        # Case1: strange function pointer void (*_fns[32])(void);
+        outCppContent = re.sub(r'(%s)\[(\d*)\]\)\(' % IDENTIFIER_PAT, r'*\1)(', outCppContent)
+        # (OLD) Case2: UINT8 LinkKey[16]);
+        #outCppContent = re.sub(r'(%s)\[(\d*)\]\)' % IDENTIFIER_PAT, r'*\1)', outCppContent)
+        # Case2: , TYPNAME fieldName[]) , replace first to avoid be replaced by next regex
+        #   Note TYPNAME can have modifiers like const/unsigned
+        #   Sidecase: there will be something like `Tcl_Obj *(__cdecl *tcl_ConcatObj)(int, Tcl_Obj *const [])`
+        #   Because const modifier are useless, so `*const []` equals to `**const` and `*const *`, so we decide to see const as a name identifier
+        #      We simply make this regex allow spaces after name to support this case
+        outCppContent = re.sub(
+            r'((?<=,|\() *)'  # match a , XXX or (XXX, with optional space, can't use lookaround because ` *` match
+            + r'(%s[ *]+)(%s *)' % (TYPEREF_PAT, IDENTIFIER_PAT)  # match identifier1 & 2
+            + '\[\d*\]'  # match the array
+            + '(\)|;|,)'  # match ending: XXX[]) or XXX[]; or XXX[],
+            , r'\1\2 *    \3\4',  # replace into (, )TYPNAME *fieldName(;,)
+            outCppContent)
+        # Case3: , TYPNAME[])
+        outCppContent = re.sub(
+              r'((?<=,|\() *)' # match a , XXX or (XXX, with optional space
+                            # must uses lookbehind because there will be successive matches like: `(GLdouble[3], void *[4], GLfloat[4], ...)`
+            + r'(%s[ *]*)' % TYPEREF_PAT # match an identifier
+            + '\[\d*\]' # match the array
+            + '(\)|;|,)' # match ending: XXX[]) or XXX[]; or XXX[],
+            , r'\1\2 *       \3', # replace into (, )XXX *(;,)
+            outCppContent)
+        # Can not assert this, because we still [XXX] in struct
+        # assert not re.search(r'\[(\d*)\](,|\))', outCppContent)
 
     return outCppContent
 
@@ -562,6 +719,9 @@ def gen_ctypes_cpp(hdrLoc, outCpp, depends=()):
         f.write('\n')
         f.write(symbols)
 
+    with open(str(outCpp) + '.json', 'w') as f:
+        json.dump(type_defs, f, cls=MyEncoder)
+
     # Step: Generate Output
     outCppContent = outputCtypesLibCpp(type_defs, symbols)
 
@@ -573,16 +733,35 @@ def gen_ctypes_cpp(hdrLoc, outCpp, depends=()):
     incls = []
 
     incls.append(getIncStmt(ROOT_DIR / 'common.h'))
+    # if not GHIDRA_MODE: # uses ghidra's "Use opened archive feature instead of this"
     for path in depends:
-        incls.append(getIncStmt(path.replace('.h', '.cpp')))
+        incls.append(getIncStmt(path))
+
+    macros = []
+    for t in HELPER_TYPES:
+        if t in type_defs:
+            tt = type_defs[t]
+            if tt.typClass in ('enum', 'union', 'struct') and '{' not in tt.typDef: # forward decl like `enum XXX;`
+                continue
+            macros.append('HAVETYPE_%s' % t)
+
+    if GHIDRA_MODE:
+        macros.append('GHIDRA')
 
     inclGuard = 'INCLUDE_GUARD_%s' % (re.sub('[^A-Za-z0-9_]', '_', Path(hdrLoc).stem))
     with open(outCpp, 'w') as f:
+        # InclGuard begin
         f.write('#ifndef %s\n' % inclGuard
-            + '#define %s\n' % inclGuard
-            + '\n'.join(incls) + '\n\n' + outCppContent
-            + '\n\n#endif\n'
-        )
+                + '#define %s\n' % inclGuard)
+        # Includes
+        f.write('\n'.join(incls))
+        # Predefine macros
+        for c in macros:
+            f.write('#define %s\n' % c)
+        # Main body
+        f.write('\n\n' + outCppContent)
+        # InclGuard ends
+        f.write('\n\n#endif\n')
 
 def do_clang2py(outCpp, outLoc, depends=()):
     print("========= Calling clang2py!")
@@ -638,10 +817,7 @@ def gen_ctypes(hdrLoc, outLoc, depends=()):
         print("========= Ghidra Hdr Gen finished!")
 
 def main(args):
-    if not args:
-        gen_ctypes('idasdk_win/idasdk_win.h', 'idasdk_win/idasdk_win.py')
-    else:
-        gen_ctypes(args[0], args[1], args[2:])
+    gen_ctypes(args[0], args[1], args[2:])
 
 if __name__ == '__main__':
     import sys
